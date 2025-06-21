@@ -17,6 +17,11 @@
 //! assert!(slot.is_none());
 //! ```
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
 use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -32,9 +37,6 @@ pub struct AtomicSlot<T> {
     inner: AtomicPtr<T>,
     _phantom: PhantomData<Option<Box<T>>>,
 }
-
-unsafe impl<T> Send for AtomicSlot<T> {}
-unsafe impl<T> Sync for AtomicSlot<T> {}
 
 impl<T> Default for AtomicSlot<T> {
     /// Creates an empty `AtomicSlot<T>`.
@@ -205,3 +207,77 @@ impl<T> AtomicSlot<T> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn sequential_swap_and_take() {
+        let slot = AtomicSlot::new(Box::new(10));
+
+        let old = slot.swap(Some(Box::new(20)));
+        assert_eq!(*old.unwrap(), 10);
+
+        let taken = slot.take();
+        assert_eq!(*taken.unwrap(), 20);
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn sequential_empty_store() {
+        let slot = AtomicSlot::<i32>::empty();
+        assert!(slot.is_none());
+
+        slot.store(Some(Box::new(5)));
+        assert!(slot.is_some());
+        assert_eq!(*slot.take().unwrap(), 5);
+    }
+
+    /// Verify that AtomicSlot<T> is Send by moving it into a thread.
+    #[test]
+    fn atomic_slot_is_send() {
+        let slot = AtomicSlot::new(Box::new(42));
+        let handle = thread::spawn(move || {
+            // We can take the value inside the spawned thread
+            assert_eq!(*slot.take().unwrap(), 42);
+        });
+        handle.join().unwrap();
+    }
+
+    /// Verify that AtomicSlot<T> is Sync by sharing a reference across threads.
+    #[test]
+    fn atomic_slot_is_sync() {
+        let slot = Arc::new(AtomicSlot::new(Box::new(100)));
+        let slot_clone = slot.clone();
+        let handle = thread::spawn(move || {
+            // &AtomicSlot<i32> must be Sync to allow shared access
+            assert_eq!(*slot_clone.take().unwrap(), 100);
+        });
+        handle.join().unwrap();
+    }
+
+    /// Multiple threads racing to take the single value: only one succeeds.
+    #[test]
+    fn racing_threads_take_once() {
+        let slot = Arc::new(AtomicSlot::new(Box::new(7)));
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let slot = slot.clone();
+            handles.push(thread::spawn(move || {
+                slot.take().map(|b| *b)
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+
+        // Exactly one thread saw the value
+        assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
+        // The other three saw None
+        assert_eq!(results.iter().filter(|r| r.is_none()).count(), 3);
+    }
+}
